@@ -34,6 +34,7 @@ def parse_commandline():
     parser = optparse.OptionParser()
     parser.add_option("--doPlots",  action="store_true", default=False)
     parser.add_option("--doPE",  action="store_true", default=False)
+    parser.add_option("--doContour",  action="store_true", default=False)
 
     parser.add_option("-f","--filename",default="../data/fringe_PCArandom_comp06.c01_q1.20190907.fits")
     parser.add_option("-o","--outputDir",default="../output")
@@ -151,19 +152,30 @@ if opts.doPlots:
     plt.savefig(plotName)
     plt.close()
 
+if opts.doContour:
+    fig = plt.figure(figsize=(20,20))   
+    ax = plt.gca()
+    cs = plt.contour(imdata, levels=5, colors='k', alpha=0.3)
+    plt.clabel(cs, inline=True, fontsize=8)
+    plt.imshow(imdata)
+    plt.colorbar()
+    plotName = os.path.join(outdir,'contour.png')
+    plt.savefig(plotName)
+    plt.close()
+
 if opts.doPE:
     import pymultinest
 
     n_live_points = 100
     evidence_tolerance = 0.5
-    max_iter = 1000
+    max_iter = -1
     
     parameters = ["n1","n2","amp1","amp2","nwaves_rms"]
     labels = [r"$n_1$",r"$n_2$",r"$amp_1$",r"$amp_2$",r"$nwaves_{\rm rms}$"]
     n_params = len(parameters)
-    pymultinest.run(myloglike, myprior, n_params, importance_nested_sampling = False, resume = True, verbose = True, sampling_efficiency = 'parameter', n_live_points = n_live_points, outputfiles_basename='%s/2-'%outdir, evidence_tolerance = evidence_tolerance, multimodal = False, max_iter = max_iter)
-    
-    multifile = os.path.join(outdir, '2-post-equal-weights.dat')
+    multifile = os.path.join(outdir, '2-post_equal_weights.dat')
+    if not os.path.isfile(multifile):
+        pymultinest.run(myloglike, myprior, n_params, importance_nested_sampling = False, resume = True, verbose = True, sampling_efficiency = 'parameter', n_live_points = n_live_points, outputfiles_basename='%s/2-'%outdir, evidence_tolerance = evidence_tolerance, multimodal = False, max_iter = max_iter)
     data = np.loadtxt(multifile)
 
     n1 = data[:,0]

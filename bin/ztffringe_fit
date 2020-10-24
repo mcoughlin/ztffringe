@@ -1,0 +1,292 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+import os
+import optparse
+import datetime
+
+import numpy as np
+# Set up matplotlib and use a nicer set of plot parameters
+
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+import matplotlib.lines as lines
+import matplotlib.patches as patches
+
+from astropy.utils.data import download_file
+from astropy.io import fits
+from astropy.time import Time
+import pandas 
+from iminuit import Minuit
+from scipy import interpolate
+from scipy import optimize
+
+from findpeaks import findpeaks
+
+def parse_commandline():
+    """
+    Parse the options given on the command-line.
+    """
+    parser = optparse.OptionParser()
+    parser.add_option("--doPlots",  action="store_true", default=False)
+    parser.add_option("--doPE",  action="store_true", default=False)
+    parser.add_option("--doContour",  action="store_true", default=False)
+
+    parser.add_option("-d","--dataDir",default="../data/")
+    parser.add_option("-f","--filename",default="../data/fringe_PCArandom_comp06.c01_q1.20190907.fits")
+    parser.add_option("-o","--outputDir",default="../output")
+
+    opts, args = parser.parse_args()
+
+    return opts
+
+def get_CCD(ccdID, normalization=False):
+    # Merging of the 4 quadrants (00, 01, 02, 03) of a CCD 
+    # in a single image with the quadrant sub-structure
+    #             q2 q1
+    #             q3 q4
+
+    print('--> CCD', ccdID)
+    dirname = "../data/" # --> Michael data directrory
+    filename = "fringe_PCArandom_comp06.c"+ccdID # --> Generic quadrant file names
+    imgfile1 = dirname+filename+"_q1.20190907.fits" # --> Quadrant 1 extension
+    imgfile2 = dirname+filename+"_q2.20190907.fits" # --> Quadrant 2 extension
+    imgfile3 = dirname+filename+"_q3.20190907.fits" # --> Quadrant 3 extension 
+    imgfile4 = dirname+filename+"_q4.20190907.fits" # --> Quadrant 4 extension
+    q1 = fits.getdata(imgfile1, 0)
+    q2 = fits.getdata(imgfile2, 0)
+    q3 = fits.getdata(imgfile3, 0)
+    q4 = fits.getdata(imgfile4, 0)
+    
+    # Each quadrant is rotated by 180° before merging
+    q1 = np.rot90(q1, 2)
+    q2 = np.rot90(q2, 2)
+    q3 = np.rot90(q3, 2)
+    q4 = np.rot90(q4, 2)
+
+    # Parameters for normalization
+    if (normalization):
+        npx = 100
+        nymax = len(q1)
+        nxmax = len(q1[0])
+    
+    if (normalization):
+        q1mean = np.mean(q1[0:nymax,0:npx])
+        q2mean = np.mean(q2[0:nymax,nxmax-npx:nxmax])
+        q12mean = (q1mean + q2mean) / 2
+        q1 += q12mean-q1mean
+        q2 += q12mean-q2mean
+    ccd_up = np.concatenate((q2, q1), axis=1) 
+    # Horizontal merging of CCD quadrants 02 and 03
+    if (normalization):
+        q3mean = np.mean(q3[0:nymax,nxmax-npx:nxmax])
+        q4mean = np.mean(q4[0:nymax,0:npx])
+        q34mean = (q3mean + q4mean) / 2
+        q3 += q34mean-q3mean
+        q4 += q34mean-q4mean
+    ccd_down = np.concatenate((q3, q4), axis=1) 
+    # Vertical merging of the two above half-CCD 
+    if (normalization):
+        ccd_up_mean = np.mean(ccd_up[0:npx,0:2*nxmax])
+        ccd_down_mean = np.mean(ccd_down[nymax-npx:nymax,0:2*nxmax])
+        ccd_mean = (ccd_up_mean + ccd_down_mean) / 2
+        ccd_up += ccd_mean-ccd_up_mean
+        ccd_down += ccd_mean-ccd_down_mean
+    ccd = np.concatenate((ccd_down, ccd_up), axis=0) 
+
+    return ccd
+
+def plot(img, xmin=-1, xmax=1, save_as=None):
+    fig = plt.figure(figsize=(10, 4))
+    fig.add_subplot(121)
+    plt.imshow(img, interpolation='nearest', origin='lower', cmap='gray', vmin=xmin, vmax=xmax)
+    plt.axis('off')
+    #plt.colorbar()
+    fig.add_subplot(122)
+    plt.hist(img.flatten(), bins=200, range=[xmin,xmax])
+    plt.xlim(xmin, xmax)
+    plt.yscale('log')
+    str0 = 'Mean = {0:1.2e} \n Std = {1:1.2e}'.format(np.mean(img), np.std(img))
+    plt.legend(loc='best', shadow=True, fontsize='small', title=str0)    
+    if (save_as is not None):
+        fig.savefig(save_as+".png", dpi=150, bbox_inches='tight')
+    plt.close()
+    return
+
+def get_stamp(img, x0=None, y0=None, dx=None, dy=None, x1=None, x2=None, y1=None, y2=None):
+    if ((x0 is not None) and (y0 is not None) and (dx is not None) and (dy is not None)):
+        xx0 = int(x0)
+        yy0 = int(y0)
+        ddx = int(dx/2)
+        ddy = int(dy/2)
+        return img[x0-ddx:x0+ddx, y0-ddy:y0+ddy]
+    if ((x1 is not None) and (x2 is not None) and (y1 is not None) and (y2 is not None)):
+        xx1 = int(x1)
+        xx2 = int(x2)
+        yy1 = int(y1)
+        yy2 = int(y2)
+        return img[xx1:xx2, yy1:yy2]
+
+def is_sorted(a):
+    nFalse = 0
+    for i in range(len(a)-1):
+        if (a[i+1] < a[i]):
+            nFalse += 1
+            #if (nFalse>1):
+            return False
+    return True
+
+def is_unsorted(a):
+    nFalse = 0
+    for i in range(len(a)-1):
+        if (a[i+1] > a[i]):
+            nFalse += 1
+            #if (nFalse>1):
+            return False
+    return True
+
+def is_rising(a):
+    grad0 = 0.01
+    grad = (a[len(a)-1] - np.min(a)) / len(a)
+    if (grad < grad0):
+        return False
+    return True
+
+def is_unrising(a):
+    grad0 = 0.01
+    grad = (a[0] - np.min(a)) / len(a)
+    if (grad < grad0):
+        return False
+    return True
+
+def is_peak_bis(strip, i, npeak):
+    if (i<npeak or (len(strip)-i)<npeak):
+        return False
+    i1 = int(npeak/2)
+    i2 = npeak
+    am1 = strip[i-i1:i+1]
+    am2 = strip[i-i2:i+1]
+    ap1 = strip[i:i+i1]
+    ap2 = strip[i:i+i2]
+    if (is_sorted(am1) and is_unsorted(ap1)):
+        return True
+    if (is_rising(am2) and is_unrising(ap2)):
+        return True
+    else:
+        return False
+
+def find_peak_bis(strip):
+    npeak = 8
+    xpeak = []
+    ip = 0
+    for i in range(len(strip)):
+        if (is_peak_bis(strip, i, npeak) and np.abs(i-ip)>npeak):
+            ip = i
+            xpeak.append(i)
+    return xpeak
+
+# Parse command line
+opts = parse_commandline()
+
+# ----- settings ------ #
+baseoutdir = opts.outputDir
+
+# In[4]:
+outdir = os.path.join(baseoutdir, 'fringe_fit')
+if not os.path.isdir(outdir):
+    os.makedirs(outdir)
+
+# Fringing image ID
+cID='01'
+ccd = get_CCD(ccdID=cID, normalization=True)
+print(ccd.shape)
+
+m0 = np.median(ccd)
+s0 = np.std(ccd)
+Imin = m0 - s0
+Imax = m0 + s0
+
+if opts.doPlots:
+    plotName = os.path.join(outdir,'ccd.pdf')
+    plot(ccd, Imin, Imax, save_as=plotName)
+    plt.savefig(plotName)
+    plt.close()
+
+# CCD size in pixels
+img = ccd.copy()
+nx = len(img)
+ny = len(img[0])
+
+# CCD center
+x0 = int(nx/2)
+y0 = int(ny/2)
+
+st = get_stamp(img, x0=x0, y0=y0, dx=20, dy=ny)
+
+if opts.doPlots:
+    plotName = os.path.join(outdir,'img.pdf')
+    plot(img, -1.5, 1.5, save_as=plotName)
+
+    plotName = os.path.join(outdir,'stamp.pdf')
+    plot(st, -1.5, 1.5, save_as=plotName)
+
+
+# Plot selected profile
+print(nx, ny)
+x = np.arange(0,ny,1)
+print(st.shape)
+y = np.mean(st, axis=0)
+print(x.shape, y.shape)
+#data_xy = {'pixel': x, 'I_fringe': y}
+#df = pandas.DataFrame(data=data_xy)
+
+xmin = 0
+xmax = ny
+xx = x[xmin:xmax]
+yy = y[xmin:xmax]
+
+if opts.doPlots:
+    fig = plt.figure(figsize=(10, 4))
+    fig.add_subplot(111)
+    plt.scatter(xx, yy, color='red')
+    plotName = os.path.join(outdir,'scatter.pdf')
+    plt.savefig(plotName)
+    plt.close()
+
+#xpeak = find_peak_bis(yy)
+
+# Initialize
+fp = findpeaks(method='peakdetect', interpolate=10)
+results = fp.fit(yy)
+
+if opts.doPlots:
+    fp.plot1d()
+    plotName = os.path.join(outdir,'oned.pdf')
+    plt.savefig(plotName)
+    plt.close()
+
+# Initialize
+fp = findpeaks(method='topology', scale=True,
+               denoise='lee_enhanced', 
+               cu=1.0,
+               imsize=(100,100), verbose=3)
+
+# Fit
+results = fp.fit(img)
+
+if opts.doPlots:
+    fp.plot()
+    #fp.plot_mesh(wireframe=False, title='image_lee_enhanced')
+    plotName = os.path.join(outdir,'interp.pdf')
+    plt.savefig(plotName)
+    plt.close()
+    
+    fp.plot_persistence()
+    #fp.plot_mesh(wireframe=False, title='image_lee_enhanced')
+    plotName = os.path.join(outdir,'persistence.pdf')
+    plt.savefig(plotName)
+    plt.close()
+

@@ -8,14 +8,21 @@ import optparse
 import datetime
 
 import numpy as np
+import pandas as pd
+
 # Set up matplotlib and use a nicer set of plot parameters
 
 import matplotlib
+matplotlib.use('Agg')
+font = {'size'   : 22}
+matplotlib.rc('font', **font)
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import matplotlib.lines as lines
 import matplotlib.patches as patches
 
+from astropy.coordinates import SkyCoord
+from astropy import units as u
 from astropy.utils.data import download_file
 from astropy.io import fits
 from astropy.time import Time
@@ -23,6 +30,7 @@ import pandas
 from iminuit import Minuit
 from scipy import interpolate
 from scipy import optimize
+import skimage
 
 from findpeaks import findpeaks
 
@@ -217,8 +225,9 @@ if opts.doPlots:
 
 # CCD size in pixels
 img = ccd.copy()
-nx = len(img)
-ny = len(img[0])
+subsamp = 5
+img = skimage.measure.block_reduce(img, (subsamp,subsamp), func=np.mean)
+nx, ny = img.shape
 
 # CCD center
 x0 = int(nx/2)
@@ -245,48 +254,152 @@ print(x.shape, y.shape)
 
 xmin = 0
 xmax = ny
-xx = x[xmin:xmax]
-yy = y[xmin:xmax]
+ymin = 0
+ymax = nx
 
-if opts.doPlots:
-    fig = plt.figure(figsize=(10, 4))
-    fig.add_subplot(111)
-    plt.scatter(xx, yy, color='red')
-    plotName = os.path.join(outdir,'scatter.pdf')
-    plt.savefig(plotName)
-    plt.close()
+mult=10
 
-#xpeak = find_peak_bis(yy)
+data_out_x = {}
+data_out_y = {}
 
-# Initialize
-fp = findpeaks(method='peakdetect', interpolate=10)
-results = fp.fit(yy)
+for ii in range(ymin,ymax):
+    outdirtmp = os.path.join(outdir, 'x_%d' % ii)
+    if not os.path.isdir(outdirtmp):
+        os.makedirs(outdirtmp)
 
-if opts.doPlots:
-    fp.plot1d()
-    plotName = os.path.join(outdir,'oned.pdf')
-    plt.savefig(plotName)
-    plt.close()
-
-# Initialize
-fp = findpeaks(method='topology', scale=True,
-               denoise='lee_enhanced', 
-               cu=1.0,
-               imsize=(100,100), verbose=3)
-
-# Fit
-results = fp.fit(img)
-
-if opts.doPlots:
-    fp.plot()
-    #fp.plot_mesh(wireframe=False, title='image_lee_enhanced')
-    plotName = os.path.join(outdir,'interp.pdf')
-    plt.savefig(plotName)
-    plt.close()
+    outfile = os.path.join(outdirtmp, 'dxdy.dat')
+    if not os.path.isfile(outfile):
+        # Initialize
+        fp = findpeaks(method='peakdetect', interpolate=mult)
+        yy = img[ii,:]
+        results = fp.fit(yy)
+        df = results["df_interp"]
+        xs_peaks = df.x[np.where(df.peak)[0]].values
+        xs_valleys = df.x[np.where(df.valley)[0]].values
+        ys_peaks = df.y[np.where(df.peak)[0]].values
+        ys_valleys = df.y[np.where(df.valley)[0]].values
+        
+        h5file = os.path.join(outdirtmp, 'peaks.hdf5')
+        df.to_hdf(h5file, key='df', mode='w')
     
-    fp.plot_persistence()
-    #fp.plot_mesh(wireframe=False, title='image_lee_enhanced')
-    plotName = os.path.join(outdir,'persistence.pdf')
-    plt.savefig(plotName)
-    plt.close()
+        fid = open(outfile, 'w')
+        for jj, xs_peak in enumerate(xs_peaks):
+            idx = np.argmin(np.abs(xs_peak-xs_valleys))
+            dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
+            fid.write('%.5f %.5f %.10f\n' % (xs_peaks[jj], ys_peaks[jj], dy_dx))
+        fid.close()
+    
+        if opts.doPlots:
+            plt.figure()
+            fp.plot1d()
+            for jj, xs_peak in enumerate(xs_peaks):
+                idx = np.argmin(np.abs(xs_peak-xs_valleys))
+                dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
+                plt.text(xs_peaks[jj]*0.98, ys_peaks[jj]*1.03, '%.4f' % dy_dx)
+            plotName = os.path.join(outdirtmp,'oned.pdf')
+            plt.savefig(plotName)
+            plt.close()
+
+    data_out = np.loadtxt(outfile)
+    data_out_x[ii] = data_out
+
+for ii in range(xmin,xmax):
+    outdirtmp = os.path.join(outdir, 'y_%d' % ii)
+    if not os.path.isdir(outdirtmp):
+        os.makedirs(outdirtmp)
+
+    outfile = os.path.join(outdirtmp, 'dxdy.dat')
+    if not os.path.isfile(outfile):
+        # Initialize
+        fp = findpeaks(method='peakdetect', interpolate=mult)
+        yy = img[:,ii]
+        results = fp.fit(yy)
+        df = results["df_interp"]
+        xs_peaks = df.x[np.where(df.peak)[0]].values
+        xs_valleys = df.x[np.where(df.valley)[0]].values
+        ys_peaks = df.y[np.where(df.peak)[0]].values
+        ys_valleys = df.y[np.where(df.valley)[0]].values
+    
+        h5file = os.path.join(outdirtmp, 'peaks.hdf5')
+        df.to_hdf(h5file, key='df', mode='w')
+    
+        fid = open(outfile, 'w')
+        for jj, xs_peak in enumerate(xs_peaks):
+            idx = np.argmin(np.abs(xs_peak-xs_valleys))
+            dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
+            fid.write('%.5f %.5f %.10f\n' % (xs_peaks[jj], ys_peaks[jj], dy_dx))
+        fid.close()
+    
+        if opts.doPlots:
+            plt.figure()
+            fp.plot1d()
+            for jj, xs_peak in enumerate(xs_peaks):
+                idx = np.argmin(np.abs(xs_peak-xs_valleys))
+                dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
+                plt.text(xs_peaks[jj]*0.98, ys_peaks[jj]*1.03, '%.4f' % dy_dx)
+            plotName = os.path.join(outdirtmp,'oned.pdf')
+            plt.savefig(plotName)
+            plt.close()
+
+    data_out = np.loadtxt(outfile)
+    data_out_y[ii] = data_out
+
+fac = 1/mult
+
+coords1 = np.empty((0,3))
+for ii in data_out_x.keys():
+    data_out = data_out_x[ii]
+    dat = np.vstack((fac*data_out[:,0],
+                     ii*np.ones(data_out[:,0].shape),data_out[:,2])).T
+    coords1 = np.append(coords1, dat, axis=0)
+
+coords2 = np.empty((0,3))
+for ii in data_out_y.keys():
+    data_out = data_out_y[ii]
+    dat = np.vstack((ii*np.ones(data_out[:,0].shape),
+                     fac*data_out[:,0],data_out[:,2])).T
+    coords2 = np.append(coords2, dat, axis=0)
+
+data = np.empty((0,3))
+for row in coords1:
+    dist = np.sqrt((row[0]-coords2[:,0])**2 + (row[1]-coords2[:,1])**2)
+    mindist = np.min(dist)
+    if mindist > 1:
+        data = np.append(data, [row], axis=0)
+    else: 
+        idx = np.argmin(dist)
+        newrow = [row[0], row[1], np.sqrt(row[2]**2 + coords2[idx,2]**2)]
+        data = np.append(data, [row], axis=0)
+
+for row in coords2:
+    dist = np.sqrt((row[0]-coords1[:,0])**2 + (row[1]-coords1[:,1])**2)
+    mindist = np.min(dist)
+    if mindist > 1:
+        data = np.append(data, [row], axis=0)
+    else:
+        idx = np.argmin(dist)
+        newrow = [row[0], row[1], np.sqrt(row[2]**2 + coords1[idx,2]**2)]
+        data = np.append(data, [row], axis=0)
+
+plt.figure(figsize=(20,20))
+plt.scatter(data[:,0], data[:,1], s=20, c=np.log10(data[:,2]))
+cbar = plt.colorbar()
+cbar.set_label(r'$\log_{10} \sqrt{(dz/dx)^2 + (dz/dy)^2}$')
+plotName = os.path.join(outdir,'scatter.png')
+plt.savefig(plotName)
+plt.close()
+
+plt.figure(figsize=(20,20))
+plt.imshow(img, interpolation='nearest', origin='lower', cmap='gray', 
+           vmin=-1, vmax=1)
+for ii in data_out_x.keys():
+    data_out = data_out_x[ii]
+    plt.plot(fac*data_out[:,0], ii*np.ones(data_out[:,0].shape), 'b*')
+for ii in data_out_y.keys():
+    data_out = data_out_y[ii]
+    plt.plot(ii*np.ones(data_out[:,0].shape), fac*data_out[:,0], 'kx')
+plotName = os.path.join(outdir,'peaks.png')
+plt.savefig(plotName)
+plt.close()
+
 

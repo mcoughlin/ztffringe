@@ -6,9 +6,11 @@
 import os
 import optparse
 import datetime
+import pickle
 
 import numpy as np
 import pandas as pd
+import h5py
 
 # Set up matplotlib and use a nicer set of plot parameters
 
@@ -30,6 +32,7 @@ import pandas
 from iminuit import Minuit
 from scipy import interpolate
 from scipy import optimize
+from scipy.interpolate import interpolate as interp
 import skimage
 
 from findpeaks import findpeaks
@@ -44,8 +47,8 @@ def parse_commandline():
     parser.add_option("--doContour",  action="store_true", default=False)
 
     parser.add_option("-d","--dataDir",default="../data/")
-    parser.add_option("-f","--filename",default="../data/fringe_PCArandom_comp06.c01_q1.20190907.fits")
     parser.add_option("-o","--outputDir",default="../output")
+    parser.add_option("-c","--ccdID",default=1,type=int)
 
     opts, args = parser.parse_args()
 
@@ -58,7 +61,7 @@ def get_CCD(ccdID, normalization=False):
     #             q3 q4
 
     print('--> CCD', ccdID)
-    dirname = "../data/" # --> Michael data directrory
+    dirname = "../data/fringe/" # --> Michael data directrory
     filename = "fringe_PCArandom_comp06.c"+ccdID # --> Generic quadrant file names
     imgfile1 = dirname+filename+"_q1.20190907.fits" # --> Quadrant 1 extension
     imgfile2 = dirname+filename+"_q2.20190907.fits" # --> Quadrant 2 extension
@@ -202,13 +205,16 @@ opts = parse_commandline()
 # ----- settings ------ #
 baseoutdir = opts.outputDir
 
-# In[4]:
-outdir = os.path.join(baseoutdir, 'fringe_fit')
+# Fringing image ID
+cID=f'{opts.ccdID:02}'
+outdir = os.path.join(baseoutdir, 'fringe_fit', cID)
 if not os.path.isdir(outdir):
     os.makedirs(outdir)
 
-# Fringing image ID
-cID='01'
+rowcoldir = os.path.join(baseoutdir, 'fringe_fit', cID, 'rowcol')
+if not os.path.isdir(rowcoldir):
+    os.makedirs(rowcoldir)
+
 ccd = get_CCD(ccdID=cID, normalization=True)
 print(ccd.shape)
 
@@ -259,108 +265,137 @@ ymax = nx
 
 mult=10
 
-data_out_x = {}
-data_out_y = {}
-
-for ii in range(ymin,ymax):
-    outdirtmp = os.path.join(outdir, 'x_%d' % ii)
-    if not os.path.isdir(outdirtmp):
-        os.makedirs(outdirtmp)
-
-    outfile = os.path.join(outdirtmp, 'dxdy.dat')
-    if not os.path.isfile(outfile):
-        # Initialize
-        fp = findpeaks(method='peakdetect', interpolate=mult)
-        yy = img[ii,:]
-        results = fp.fit(yy)
-        df = results["df_interp"]
-        xs_peaks = df.x[np.where(df.peak)[0]].values
-        xs_valleys = df.x[np.where(df.valley)[0]].values
-        ys_peaks = df.y[np.where(df.peak)[0]].values
-        ys_valleys = df.y[np.where(df.valley)[0]].values
+pklfile = os.path.join(outdir,'ccd.pkl')
+if not os.path.isfile(pklfile):
+    data_out_x = {}
+    data_out_y = {}
+    
+    for ii in range(ymin,ymax):
+        outdirtmp = os.path.join(rowcoldir, 'x_%d' % ii)
+        if not os.path.isdir(outdirtmp):
+            os.makedirs(outdirtmp)
+    
+        outfile = os.path.join(outdirtmp, 'dxdy.dat')
+        if not os.path.isfile(outfile):
+            # Initialize
+            fp = findpeaks(method='peakdetect', interpolate=mult)
+            yy = img[ii,:]
+            results = fp.fit(yy)
+            df = results["df_interp"]
+            xs_peaks = df.x[np.where(df.peak)[0]].values
+            xs_valleys = df.x[np.where(df.valley)[0]].values
+            ys_peaks = df.y[np.where(df.peak)[0]].values
+            ys_valleys = df.y[np.where(df.valley)[0]].values
+            
+            h5file = os.path.join(outdirtmp, 'peaks.hdf5')
+            df.to_hdf(h5file, key='df', mode='w')
         
-        h5file = os.path.join(outdirtmp, 'peaks.hdf5')
-        df.to_hdf(h5file, key='df', mode='w')
-    
-        fid = open(outfile, 'w')
-        for jj, xs_peak in enumerate(xs_peaks):
-            idx = np.argmin(np.abs(xs_peak-xs_valleys))
-            dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
-            fid.write('%.5f %.5f %.10f\n' % (xs_peaks[jj], ys_peaks[jj], dy_dx))
-        fid.close()
-    
-        if opts.doPlots:
-            plt.figure()
-            fp.plot1d()
+            fid = open(outfile, 'w')
             for jj, xs_peak in enumerate(xs_peaks):
                 idx = np.argmin(np.abs(xs_peak-xs_valleys))
                 dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
-                plt.text(xs_peaks[jj]*0.98, ys_peaks[jj]*1.03, '%.4f' % dy_dx)
-            plotName = os.path.join(outdirtmp,'oned.pdf')
-            plt.savefig(plotName)
-            plt.close()
-
-    data_out = np.loadtxt(outfile)
-    data_out_x[ii] = data_out
-
-for ii in range(xmin,xmax):
-    outdirtmp = os.path.join(outdir, 'y_%d' % ii)
-    if not os.path.isdir(outdirtmp):
-        os.makedirs(outdirtmp)
-
-    outfile = os.path.join(outdirtmp, 'dxdy.dat')
-    if not os.path.isfile(outfile):
-        # Initialize
-        fp = findpeaks(method='peakdetect', interpolate=mult)
-        yy = img[:,ii]
-        results = fp.fit(yy)
-        df = results["df_interp"]
-        xs_peaks = df.x[np.where(df.peak)[0]].values
-        xs_valleys = df.x[np.where(df.valley)[0]].values
-        ys_peaks = df.y[np.where(df.peak)[0]].values
-        ys_valleys = df.y[np.where(df.valley)[0]].values
+                fid.write('%.5f %.5f %.5f %.5f %.10f\n' % (xs_peaks[jj], ys_peaks[jj], xs_valleys[idx], ys_valleys[idx], dy_dx))
+            fid.close()
+        
+            if opts.doPlots:
+                plt.figure()
+                fp.plot1d()
+                for jj, xs_peak in enumerate(xs_peaks):
+                    idx = np.argmin(np.abs(xs_peak-xs_valleys))
+                    dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
+                    plt.text(xs_peaks[jj]*0.98, ys_peaks[jj]*1.03, '%.4f' % dy_dx)
+                plotName = os.path.join(outdirtmp,'oned.pdf')
+                plt.savefig(plotName)
+                plt.close()
     
-        h5file = os.path.join(outdirtmp, 'peaks.hdf5')
-        df.to_hdf(h5file, key='df', mode='w')
+        data_out = np.loadtxt(outfile)
+        data_out_x[ii] = data_out
     
-        fid = open(outfile, 'w')
-        for jj, xs_peak in enumerate(xs_peaks):
-            idx = np.argmin(np.abs(xs_peak-xs_valleys))
-            dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
-            fid.write('%.5f %.5f %.10f\n' % (xs_peaks[jj], ys_peaks[jj], dy_dx))
-        fid.close()
+    for ii in range(xmin,xmax):
+        outdirtmp = os.path.join(rowcoldir, 'y_%d' % ii)
+        if not os.path.isdir(outdirtmp):
+            os.makedirs(outdirtmp)
     
-        if opts.doPlots:
-            plt.figure()
-            fp.plot1d()
+        outfile = os.path.join(outdirtmp, 'dxdy.dat')
+        if not os.path.isfile(outfile):
+            # Initialize
+            fp = findpeaks(method='peakdetect', interpolate=mult)
+            yy = img[:,ii]
+            results = fp.fit(yy)
+            df = results["df_interp"]
+            xs_peaks = df.x[np.where(df.peak)[0]].values
+            xs_valleys = df.x[np.where(df.valley)[0]].values
+            ys_peaks = df.y[np.where(df.peak)[0]].values
+            ys_valleys = df.y[np.where(df.valley)[0]].values
+        
+            h5file = os.path.join(outdirtmp, 'peaks.hdf5')
+            df.to_hdf(h5file, key='df', mode='w')
+        
+            fid = open(outfile, 'w')
             for jj, xs_peak in enumerate(xs_peaks):
                 idx = np.argmin(np.abs(xs_peak-xs_valleys))
                 dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
-                plt.text(xs_peaks[jj]*0.98, ys_peaks[jj]*1.03, '%.4f' % dy_dx)
-            plotName = os.path.join(outdirtmp,'oned.pdf')
-            plt.savefig(plotName)
-            plt.close()
-
-    data_out = np.loadtxt(outfile)
-    data_out_y[ii] = data_out
+                fid.write('%.5f %.5f %.5f %.5f %.10f\n' % (xs_peaks[jj], ys_peaks[jj], xs_valleys[idx], ys_valleys[idx], dy_dx))
+            fid.close()
+        
+            if opts.doPlots:
+                plt.figure()
+                fp.plot1d()
+                for jj, xs_peak in enumerate(xs_peaks):
+                    idx = np.argmin(np.abs(xs_peak-xs_valleys))
+                    dy_dx = np.abs(ys_peaks[jj] - ys_valleys[idx]) / np.abs(xs_peaks[jj] - xs_valleys[idx])
+                    plt.text(xs_peaks[jj]*0.98, ys_peaks[jj]*1.03, '%.4f' % dy_dx)
+                plotName = os.path.join(outdirtmp,'oned.pdf')
+                plt.savefig(plotName)
+                plt.close()
+    
+        data_out = np.loadtxt(outfile)
+        data_out_y[ii] = data_out
+    
+    pickle.dump((data_out_x,data_out_y), open(pklfile, "wb" ) )
+(data_out_x,data_out_y) = pickle.load( open(pklfile, "rb" ) )
 
 fac = 1/mult
 
-coords1 = np.empty((0,3))
+coords1 = np.empty((0,5))
 for ii in data_out_x.keys():
     data_out = data_out_x[ii]
     dat = np.vstack((fac*data_out[:,0],
-                     ii*np.ones(data_out[:,0].shape),data_out[:,2])).T
-    coords1 = np.append(coords1, dat, axis=0)
+                     ii*np.ones(data_out[:,0].shape),
+                     fac*data_out[:,2],
+                     ii*np.ones(data_out[:,0].shape),
+                     data_out[:,4])).T
+    #coords1 = np.append(coords1, dat, axis=0)
 
-coords2 = np.empty((0,3))
+    yy = img[ii,:]
+    f = interp.interp1d(np.arange(len(yy))*mult,
+                        yy, fill_value='extrapolate')
+    for row in data_out:
+        dy_dx = np.abs(f(row[2]) - f(row[0]))/np.abs(row[2]-row[0])
+        coords1 = np.append(coords1,
+                            np.atleast_2d([fac*row[0], ii, fac*row[2], ii, dy_dx]),
+                            axis=0)
+
+coords2 = np.empty((0,5))
 for ii in data_out_y.keys():
     data_out = data_out_y[ii]
     dat = np.vstack((ii*np.ones(data_out[:,0].shape),
-                     fac*data_out[:,0],data_out[:,2])).T
-    coords2 = np.append(coords2, dat, axis=0)
+                     fac*data_out[:,0],
+                     ii*np.ones(data_out[:,0].shape),
+                     fac*data_out[:,2],
+                     data_out[:,4])).T
+    #coords2 = np.append(coords2, dat, axis=0)
 
-data = np.empty((0,3))
+    yy = img[:,ii]
+    f = interp.interp1d(np.arange(len(yy))*mult,
+                        yy, fill_value='extrapolate')
+    for row in data_out:
+        dy_dx = np.abs(f(row[2]) - f(row[0]))/np.abs(row[2]-row[0])
+        coords2 = np.append(coords1,
+                            np.atleast_2d([ii, fac*row[0], ii, fac*row[2], dy_dx]),
+                            axis=0)
+
+data = np.empty((0,5))
 for row in coords1:
     dist = np.sqrt((row[0]-coords2[:,0])**2 + (row[1]-coords2[:,1])**2)
     mindist = np.min(dist)
@@ -368,8 +403,8 @@ for row in coords1:
         data = np.append(data, [row], axis=0)
     else: 
         idx = np.argmin(dist)
-        newrow = [row[0], row[1], np.sqrt(row[2]**2 + coords2[idx,2]**2)]
-        data = np.append(data, [row], axis=0)
+        newrow = [row[0], row[1], coords2[idx,2], coords2[idx,3], np.sqrt(row[4]**2 + coords2[idx,4]**2)]
+        data = np.append(data, [newrow], axis=0)
 
 for row in coords2:
     dist = np.sqrt((row[0]-coords1[:,0])**2 + (row[1]-coords1[:,1])**2)
@@ -378,11 +413,15 @@ for row in coords2:
         data = np.append(data, [row], axis=0)
     else:
         idx = np.argmin(dist)
-        newrow = [row[0], row[1], np.sqrt(row[2]**2 + coords1[idx,2]**2)]
-        data = np.append(data, [row], axis=0)
+        newrow = [row[0], row[1], coords1[idx,2], coords1[idx,3], np.sqrt(row[4]**2 + coords1[idx,4]**2)]
+        data = np.append(data, [newrow], axis=0)
+
+catalogFile = os.path.join(outdir,"data.h5")
+with h5py.File(catalogFile, 'w') as hf:
+    hf.create_dataset("data",  data=data)
 
 plt.figure(figsize=(20,20))
-plt.scatter(data[:,0], data[:,1], s=20, c=np.log10(data[:,2]))
+plt.scatter(data[:,0], data[:,1], s=20, c=np.log10(data[:,4]))
 cbar = plt.colorbar()
 cbar.set_label(r'$\log_{10} \sqrt{(dz/dx)^2 + (dz/dy)^2}$')
 plotName = os.path.join(outdir,'scatter.png')

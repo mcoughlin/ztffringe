@@ -1,0 +1,10 @@
+
+import os, sys
+import numpy as np
+
+ccdids = np.arange(1,17)
+for ccdid in ccdids:
+    system_command = "python ztffringe_fit --doPlots --ccdID %d" % (ccdid)
+    os.system(system_command)
+    system_command = "python ztffringe_flats --doPlots --ccdID %d" % (ccdid)
+    os.system(system_command)

@@ -1,0 +1,363 @@
+#!/usr/bin/env python
+
+import os
+import numpy as np
+import glob
+import optparse
+import pickle
+import h5py
+
+import matplotlib
+#matplotlib.rc('text', usetex=True)
+matplotlib.use('Agg')
+matplotlib.rcParams.update({'font.size': 16})
+matplotlib.rcParams['contour.negative_linestyle'] = 'solid'
+import matplotlib.colors as colors
+import matplotlib.cm as cmx
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+from astropy.time import Time, TimeDelta
+import astropy.units as u
+
+from astropy.io import fits
+from astropy.table import Table, vstack
+
+from scipy import ndimage
+from scipy.interpolate import interpolate as interp
+
+import tqdm
+import aplpy
+import skimage
+
+def parse_commandline():
+    """
+    Parse the options given on the command-line.
+    """
+    parser = optparse.OptionParser()
+    parser.add_option("--doPlots",  action="store_true", default=False)
+    parser.add_option("--doImages",  action="store_true", default=False)
+    parser.add_option("--doWriteFits",  action="store_true", default=False)
+    parser.add_option("--doMosaic",  action="store_true", default=False)
+
+    parser.add_option("-d","--dataDir",default="../data/1104/051262/")
+    parser.add_option("-o","--outputDir",default="../output")
+
+    parser.add_option("-c","--ccdID",default=1,type=int)
+
+    opts, args = parser.parse_args()
+
+    return opts
+
+def get_CCD(ccd, normalization=False):
+    # Merging of the 4 quadrants (00, 01, 02, 03) of a CCD 
+    # in a single image with the quadrant sub-structure
+    #             q2 q1
+    #             q3 q4
+
+    hdu = fits.open(ccd)
+  
+    kk=0
+    q1 = hdu[kk+1].data
+    kk=1
+    q2 = hdu[kk+1].data
+    kk=2
+    q3 = hdu[kk+1].data
+    kk=3
+    q4 = hdu[kk+1].data
+
+    # Each quadrant is rotated by 180° before merging
+    q1 = np.rot90(q1, 2)
+    q2 = np.rot90(q2, 2)
+    q3 = np.rot90(q3, 2)
+    q4 = np.rot90(q4, 2)
+
+    # Parameters for normalization
+    if (normalization):
+        npx = 100
+        nymax = len(q1)
+        nxmax = len(q1[0])
+
+    if (normalization):
+        q1mean = np.mean(q1[0:nymax,0:npx])
+        q2mean = np.mean(q2[0:nymax,nxmax-npx:nxmax])
+        q12mean = (q1mean + q2mean) / 2
+        q1 += q12mean-q1mean
+        q2 += q12mean-q2mean
+    ccd_up = np.concatenate((q2, q1), axis=1)
+    # Horizontal merging of CCD quadrants 02 and 03
+    if (normalization):
+        q3mean = np.mean(q3[0:nymax,nxmax-npx:nxmax])
+        q4mean = np.mean(q4[0:nymax,0:npx])
+        q34mean = (q3mean + q4mean) / 2
+        q3 += q34mean-q3mean
+        q4 += q34mean-q4mean
+    ccd_down = np.concatenate((q3, q4), axis=1)
+    # Vertical merging of the two above half-CCD 
+    if (normalization):
+        ccd_up_mean = np.mean(ccd_up[0:npx,0:2*nxmax])
+        ccd_down_mean = np.mean(ccd_down[nymax-npx:nymax,0:2*nxmax])
+        ccd_mean = (ccd_up_mean + ccd_down_mean) / 2
+        ccd_up += ccd_mean-ccd_up_mean
+        ccd_down += ccd_mean-ccd_down_mean
+    ccd = np.concatenate((ccd_down, ccd_up), axis=0)
+
+    return ccd
+
+def read_ccd(ccd):
+ 
+    chunks = []
+    rows = []
+
+    hdu = fits.open(ccd)
+
+    try:
+        lines = np.shape(hdu[1].data)[0]
+    except:
+        print("%s messed up..."%(ccd))
+        return []
+
+    active_pixels = np.shape(hdu[1].data)[1]
+    overscan = np.shape(hdu[5].data)[1]
+    npix = active_pixels+overscan
+   
+    raw = np.zeros((4,lines,npix))
+    raw = np.zeros((4,lines,active_pixels))
+    kk=0
+    raw[kk] = hdu[kk+1].data
+    kk=1
+    raw[kk] = hdu[kk+1].data[:,::-1]
+    kk=2
+    raw[kk] = hdu[kk+1].data[::-1,::-1]
+    kk=3                                                                        
+    raw[kk] = hdu[kk+1].data[::-1,:]
+
+    for kk in [0,1,2,3]:
+        raw[kk][np.isnan(raw[kk])] = 0.0 
+        raw[kk] -= np.median(raw[kk])
+        print(np.median(raw[kk]))
+        #raw[kk] -= np.median(raw[kk], axis=0)
+
+    return raw
+
+def get_file(datadir,imagenum,ccdnum):
+    ccdfile = glob.glob(os.path.join(datadir,'ztf_%d_*_c%02d_*.fits.fz'%(imagenum,ccdnum)))
+    if len(ccdfile) > 0:
+        return ccdfile[0]
+    else:
+        return None
+
+def rebin(a, new_shape):
+    M, N = a.shape
+    m, n = new_shape
+    if m<M:
+        mat = a.reshape((m,int(M/m),n,int(N/n))).mean(3).mean(1)
+        return mat
+    else:
+        return np.repeat(np.repeat(a, int(m/M), axis=0), int(n/N), axis=1)
+
+def combine_raw_files(ccds, outfile, gapX = 462, gapY = 645, fill_value = 0, downsample_x=1, downsample_y=1):
+    gapX = int(gapX/downsample_x)
+    gapY = int(gapY/downsample_y)
+    rows = []
+    for ccdrow in tqdm.tqdm(range(4)):
+        for qrow in range(2):
+            chunks = []
+            rows_tmp = []
+            for ccd in range(4):
+                hdulist = fits.open(ccds[4 * ccdrow + (4 - ccd) - 1])
+                if qrow == 0:
+                    img_data_1 = hdulist[3].data
+                    img_data_2 = hdulist[4].data
+                else:
+                    img_data_1 = hdulist[2].data
+                    img_data_2 = hdulist[1].data
+                # Z-scale
+                #img_data_1 = StandardScaler().fit_transform(img_data_1)
+                #img_data_2 = StandardScaler().fit_transform(img_data_2)
+                # Rotate by 180 degrees
+                img_data_1 = np.rot90(img_data_1, 2)
+                img_data_2 = np.rot90(img_data_2, 2)
+
+                M, N = img_data_1.shape
+                new_shape = (int(M/downsample_x),int(N/downsample_y))
+                img_data_1 = rebin(img_data_1, new_shape)
+                img_data_2 = rebin(img_data_2, new_shape)
+
+                lowpass = ndimage.gaussian_filter(img_data_1, 100)
+                img_data_1 = img_data_1 - lowpass
+
+                lowpass = ndimage.gaussian_filter(img_data_2, 100)
+                img_data_2 = img_data_2 - lowpass
+
+                x_gap = np.zeros((img_data_1.shape[0], gapX)) + fill_value
+                chunks.append(np.hstack((img_data_1, img_data_2)))
+            row_data = np.hstack((chunks[0], x_gap, chunks[1], x_gap, chunks[2], x_gap, chunks[3]))
+            rows_tmp.append(row_data)
+            rows.append(row_data)
+        array_tmp = np.vstack(rows_tmp)
+        fits.writeto(outfile.replace(".fits","%d.fits" % (ccdrow)), array_tmp, header = fits.getheader(ccds[0], 0), overwrite = True)
+        if ccdrow < 3: rows.append(np.zeros((gapY, row_data.shape[1])) + fill_value)
+    # Increasing Dec is decreasing y
+    array = np.vstack(rows)
+    fits.writeto(outfile, array, header = fits.getheader(ccds[0], 0), overwrite = True)
+
+def plot(img, xmin=-1, xmax=1, save_as=None):
+    fig = plt.figure(figsize=(10, 4))
+    fig.add_subplot(121)
+    plt.imshow(img, interpolation='nearest', origin='lower', cmap='gray', vmin=xmin, vmax=xmax)
+    plt.axis('off')
+    #plt.colorbar()
+    fig.add_subplot(122)
+    plt.hist(img.flatten(), bins=200, range=[xmin,xmax])
+    plt.xlim(xmin, xmax)
+    plt.yscale('log')
+    str0 = 'Mean = {0:1.2e} \n Std = {1:1.2e}'.format(np.mean(img), np.std(img))
+    plt.legend(loc='best', shadow=True, fontsize='small', title=str0)
+    if (save_as is not None):
+        fig.savefig(save_as+".png", dpi=150, bbox_inches='tight')
+    plt.close()
+    return
+
+# Parse command line
+opts = parse_commandline()
+
+# ----- settings ------ #
+datadir = opts.dataDir
+baseoutdir = opts.outputDir
+
+# Fringing image ID
+cID=f'{opts.ccdID:02}'
+
+dataDirSplit = list(filter(None,datadir.split("/")))
+imagenum = dataDirSplit[-1]
+datenum = dataDirSplit[-2]
+
+outdir = os.path.join(baseoutdir, datenum, imagenum, cID)
+imagedir = os.path.join(outdir,'images')
+fitsdir = os.path.join(outdir,'fits')
+ccddir = os.path.join(baseoutdir, 'fringe_fit', cID)
+ccdh5file = os.path.join(ccddir, 'data.h5')
+
+if not os.path.isdir(outdir):
+    os.makedirs(outdir)
+if not os.path.isdir(imagedir):
+    os.makedirs(imagedir)
+if not os.path.isdir(fitsdir):
+    os.makedirs(fitsdir)
+
+##################################
+#                                #
+#           PREPARATION          #
+#                                #
+##################################
+
+image = glob.glob(os.path.join(datadir,'*%s*.fits.fz' % cID))[0]
+ccd = get_CCD(image, normalization=True)
+
+m0 = np.median(ccd)
+s0 = np.std(ccd)
+Imin = m0 - 2*s0
+Imax = m0 + 2*s0
+
+if opts.doPlots:
+    plotName = os.path.join(outdir,'ccd.pdf')
+    plot(ccd, Imin, Imax, save_as=plotName)
+    plt.savefig(plotName)
+    plt.close()
+
+# CCD size in pixels
+img = ccd.copy()
+subsamp = 5
+img = skimage.measure.block_reduce(img, (subsamp,subsamp), func=np.mean)
+nx, ny = img.shape
+
+mult=10
+pklfile = os.path.join(ccddir,'ccd.pkl')
+(data_out_x,data_out_y) = pickle.load( open(pklfile, "rb" ) )
+fac = 1/mult
+
+coords1 = np.empty((0,5))
+for ii in data_out_x.keys():
+    data_out = data_out_x[ii]
+    yy = img[ii,:]
+    f = interp.interp1d(np.arange(len(yy))*mult,
+                        yy, fill_value='extrapolate')
+    for row in data_out:
+        dy_dx = np.abs(f(row[2]) - f(row[0]))/np.abs(row[2]-row[0])
+        coords1 = np.append(coords1,
+                            np.atleast_2d([fac*row[0], ii, fac*row[2], ii, dy_dx]),
+                            axis=0)
+
+coords2 = np.empty((0,5))
+for ii in data_out_y.keys():
+    data_out = data_out_y[ii]
+    yy = img[:,ii]
+    f = interp.interp1d(np.arange(len(yy))*mult,
+                        yy, fill_value='extrapolate')
+    for row in data_out:
+        dy_dx = np.abs(f(row[2]) - f(row[0]))/np.abs(row[2]-row[0])
+        coords2 = np.append(coords1,
+                            np.atleast_2d([ii, fac*row[0], ii, fac*row[2], dy_dx]),
+                            axis=0)
+
+data = np.empty((0,5))
+for row in coords1:
+    dist = np.sqrt((row[0]-coords2[:,0])**2 + (row[1]-coords2[:,1])**2)
+    mindist = np.min(dist)
+    if mindist > 1:
+        data = np.append(data, [row], axis=0)
+    else:
+        idx = np.argmin(dist)
+        newrow = [row[0], row[1], coords2[idx,2], coords2[idx,3], np.sqrt(row[4]**2 + coords2[idx,4]**2)]
+        data = np.append(data, [newrow], axis=0)
+
+for row in coords2:
+    dist = np.sqrt((row[0]-coords1[:,0])**2 + (row[1]-coords1[:,1])**2)
+    mindist = np.min(dist)
+    if mindist > 1:
+        data = np.append(data, [row], axis=0)
+    else:
+        idx = np.argmin(dist)
+        newrow = [row[0], row[1], coords1[idx,2], coords1[idx,3], np.sqrt(row[4]**2 + coords1[idx,4]**2)]
+        data = np.append(data, [newrow], axis=0)
+
+catalogFile = os.path.join(outdir,"data.h5")
+with h5py.File(catalogFile, 'w') as hf:
+    hf.create_dataset("data",  data=data)
+
+with h5py.File(ccdh5file, 'r') as f:
+   ccddata = f['data'][:]
+
+if opts.doPlots:
+    plt.figure(figsize=(20,20))
+    plt.scatter(data[:,0], data[:,1], s=20, c=np.log10(data[:,4]))
+    cbar = plt.colorbar()
+    cbar.set_label(r'$\log_{10} \sqrt{(dz/dx)^2 + (dz/dy)^2}$')
+    plotName = os.path.join(outdir,'scatter.png')
+    plt.savefig(plotName)
+    plt.close()
+   
+    plt.figure(figsize=(20,20))
+    plt.imshow(img, interpolation='nearest', origin='lower', cmap='gray')
+    for ii in data_out_x.keys():
+        data_out = data_out_x[ii]
+        plt.plot(fac*data_out[:,0], ii*np.ones(data_out[:,0].shape), 'b*')
+    for ii in data_out_y.keys():
+        data_out = data_out_y[ii]
+        plt.plot(ii*np.ones(data_out[:,0].shape), fac*data_out[:,0], 'kx')
+    plotName = os.path.join(outdir,'peaks.png')
+    plt.savefig(plotName)
+    plt.close()
+
+    plt.figure(figsize=(20,20))
+    plt.scatter(data[:,4], ccddata[:,4], s=20)
+    plt.xlim([0,0.1])
+    plt.ylim([0,0.1])
+    cbar = plt.colorbar()
+    plt.xlabel(r'$\log_{10} \sqrt{(dz/dx)^2 + (dz/dy)^2}$')
+    plt.ylabel(r'$\log_{10} \sqrt{(dz/dx)^2 + (dz/dy)^2}$')
+    plotName = os.path.join(outdir,'comparison.png')
+    plt.savefig(plotName)
+    plt.close()

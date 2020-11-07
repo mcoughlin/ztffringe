@@ -36,7 +36,7 @@ def parse_commandline():
     parser.add_option("--doPE",  action="store_true", default=False)
     parser.add_option("--doContour",  action="store_true", default=False)
 
-    parser.add_option("-f","--filename",default="../data/fringe_PCArandom_comp06.c01_q1.20190907.fits")
+    parser.add_option("-f","--filename",default="../data/fringe/fringe_PCArandom_comp06.c01_q1.20190907.fits")
     parser.add_option("-o","--outputDir",default="../output")
 
     opts, args = parser.parse_args()
